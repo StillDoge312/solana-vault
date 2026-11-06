@@ -1,11 +1,12 @@
 use anchor_lang::prelude::*;
+use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::memo::Memo;
 use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, Transfer};
 use anchor_spl::token_2022::Token2022;
 use anchor_spl::token_interface::{self as token_interface, Mint as InterfaceMint, TokenAccount as InterfaceTokenAccount};
 use raydium_clmm_cpi::{
     cpi,
-    states::{AmmConfig, ObservationState, PoolState},
+    states::{AmmConfig, ObservationState, PersonalPositionState, PoolState, ProtocolPositionState, TickArrayState},
 };
 
 declare_id!("EbojNUfh9Jk6dyZaaQAJWofbdnkvdxfQbeAPq6iWoHAu");
@@ -15,7 +16,6 @@ pub mod simple_vault {
     use super::*;
 
     /// Создать vault для конкретного SPL-токена.
-    /// Создаёт: VaultState PDA, vault_token_account PDA, share_mint PDA.
     pub fn initialize_vault(ctx: Context<InitializeVault>) -> Result<()> {
         let vault = &mut ctx.accounts.vault_state;
         vault.admin = ctx.accounts.admin.key();
@@ -31,7 +31,6 @@ pub mod simple_vault {
     }
 
     /// Создать личную «карточку» пользователя в vault.
-    /// У каждого пользователя ровно одна карточка (PDA от vault + user).
     pub fn create_user_card(ctx: Context<CreateUserCard>) -> Result<()> {
         let card = &mut ctx.accounts.user_card;
         card.vault = ctx.accounts.vault_state.key();
@@ -43,18 +42,13 @@ pub mod simple_vault {
     }
 
     /// Пользователь вносит `amount` токенов → получает share-токены.
-    ///
-    /// Формула:
-    ///   Первый депозит:       shares = amount  (1:1)
-    ///   Последующие депозиты: shares = amount * total_shares / total_tokens
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         require!(amount > 0, VaultError::ZeroAmount);
 
         let vault = &ctx.accounts.vault_state;
 
-        // Сколько shares получит пользователь
         let shares = if vault.total_shares == 0 || vault.total_tokens == 0 {
-            amount // первый депозит: 1 share = 1 token
+            amount
         } else {
             (amount as u128)
                 .checked_mul(vault.total_shares as u128)
@@ -64,7 +58,6 @@ pub mod simple_vault {
         };
         require!(shares > 0, VaultError::SharesTooSmall);
 
-        // 1. Переводим токены: пользователь → vault
         token::transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -77,7 +70,6 @@ pub mod simple_vault {
             amount,
         )?;
 
-        // 2. Печатаем shares пользователю (подписывает vault PDA)
         let token_mint_key = ctx.accounts.vault_state.token_mint;
         let seeds = &[
             b"vault".as_ref(),
@@ -99,7 +91,6 @@ pub mod simple_vault {
             shares,
         )?;
 
-        // 3. Обновляем vault и карточку пользователя
         let vault = &mut ctx.accounts.vault_state;
         vault.total_tokens = vault.total_tokens.checked_add(amount).ok_or(VaultError::MathOverflow)?;
         vault.total_shares = vault.total_shares.checked_add(shares).ok_or(VaultError::MathOverflow)?;
@@ -113,16 +104,12 @@ pub mod simple_vault {
     }
 
     /// Пользователь возвращает `shares_amount` share-токенов → получает базовые токены.
-    ///
-    /// Формула:
-    ///   tokens_out = shares_amount * total_tokens / total_shares
     pub fn withdraw(ctx: Context<Withdraw>, shares_amount: u64) -> Result<()> {
         require!(shares_amount > 0, VaultError::ZeroAmount);
 
         let vault = &ctx.accounts.vault_state;
         require!(vault.total_shares > 0, VaultError::VaultEmpty);
 
-        // Сколько токенов причитается за указанные shares
         let tokens_out = (shares_amount as u128)
             .checked_mul(vault.total_tokens as u128)
             .and_then(|v| v.checked_div(vault.total_shares as u128))
@@ -131,7 +118,6 @@ pub mod simple_vault {
 
         require!(tokens_out > 0, VaultError::WithdrawTooSmall);
 
-        // 1. Сжигаем shares пользователя (подписывает сам пользователь)
         token::burn(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -144,7 +130,6 @@ pub mod simple_vault {
             shares_amount,
         )?;
 
-        // 2. Переводим базовые токены из vault пользователю (подписывает vault PDA)
         let token_mint_key = ctx.accounts.vault_state.token_mint;
         let seeds = &[
             b"vault".as_ref(),
@@ -166,7 +151,6 @@ pub mod simple_vault {
             tokens_out,
         )?;
 
-        // 3. Обновляем vault и карточку
         let vault = &mut ctx.accounts.vault_state;
         vault.total_tokens = vault.total_tokens.checked_sub(tokens_out).ok_or(VaultError::MathOverflow)?;
         vault.total_shares = vault.total_shares.checked_sub(shares_amount).ok_or(VaultError::MathOverflow)?;
@@ -179,7 +163,7 @@ pub mod simple_vault {
         Ok(())
     }
 
-    /// Неделя 12: Инициализация стратегии Raydium CLMM (только админ)
+    /// Неделя 12: Инициализация стратегии Raydium CLMM
     pub fn init_strategy(ctx: Context<InitStrategy>) -> Result<()> {
         let pool = ctx.accounts.pool_state.load()?;
         let vault_token = ctx.accounts.vault_state.token_mint;
@@ -201,8 +185,7 @@ pub mod simple_vault {
         Ok(())
     }
 
-    /// Неделя 12: Обмен токенов vault через Raydium CLMM (CPI swap_v2).
-    /// Защита от проскальзывания: `min_amount_out` (other_amount_threshold).
+    /// Неделя 12: Swap через Raydium CLMM
     pub fn swap_raydium<'a, 'b, 'c: 'info, 'info>(
         ctx: Context<'a, 'b, 'c, 'info, SwapRaydium<'info>>,
         amount_in: u64,
@@ -242,10 +225,8 @@ pub mod simple_vault {
         )
         .with_remaining_accounts(remaining);
 
-        // swap_v2 с защитой от slippage
         cpi::swap_v2(cpi_ctx, amount_in, min_amount_out, 0, true)?;
 
-        // Обновляем учет токенов в VaultState при продаже базового актива
         if ctx.accounts.vault_input_token_account.mint == token_mint_key {
             let vault = &mut ctx.accounts.vault_state;
             vault.total_tokens = vault.total_tokens.saturating_sub(amount_in);
@@ -254,6 +235,182 @@ pub mod simple_vault {
         msg!("Swap executed: amount_in={}, min_amount_out={}", amount_in, min_amount_out);
         Ok(())
     }
+
+    /// Неделя 13: Открытие позиции ликвидности в Raydium CLMM.
+    /// Position NFT чеканится в пользу vault PDA (программа владеет позицией).
+    pub fn open_raydium_position<'a, 'b, 'c: 'info, 'info>(
+        ctx: Context<'a, 'b, 'c, 'info, OpenRaydiumPosition<'info>>,
+        tick_lower: i32,
+        tick_upper: i32,
+        tick_array_lower_start: i32,
+        tick_array_upper_start: i32,
+        amount_0_max: u64,
+        amount_1_max: u64,
+    ) -> Result<()> {
+        let a = &ctx.accounts;
+        require_vault_storages(&a.vault_state, &a.strategy, a.token_account_0.key(), a.token_account_1.key())?;
+
+        let open = cpi::accounts::OpenPositionWithToken22Nft {
+            payer: a.admin.to_account_info(),
+            position_nft_owner: a.vault_state.to_account_info(),
+            position_nft_mint: a.position_nft_mint.to_account_info(),
+            position_nft_account: a.position_nft_account.to_account_info(),
+            pool_state: a.pool_state.to_account_info(),
+            protocol_position: a.protocol_position.to_account_info(),
+            tick_array_lower: a.tick_array_lower.to_account_info(),
+            tick_array_upper: a.tick_array_upper.to_account_info(),
+            personal_position: a.personal_position.to_account_info(),
+            token_account_0: a.token_account_0.to_account_info(),
+            token_account_1: a.token_account_1.to_account_info(),
+            token_vault_0: a.token_vault_0.to_account_info(),
+            token_vault_1: a.token_vault_1.to_account_info(),
+            rent: a.rent.to_account_info(),
+            system_program: a.system_program.to_account_info(),
+            token_program: a.token_program.to_account_info(),
+            associated_token_program: a.associated_token_program.to_account_info(),
+            token_program_2022: a.token_program_2022.to_account_info(),
+            vault_0_mint: a.vault_0_mint.to_account_info(),
+            vault_1_mint: a.vault_1_mint.to_account_info(),
+        };
+
+        cpi::open_position_with_token22_nft(
+            CpiContext::new(a.clmm_program.to_account_info(), open).with_remaining_accounts(ctx.remaining_accounts.to_vec()),
+            tick_lower,
+            tick_upper,
+            tick_array_lower_start,
+            tick_array_upper_start,
+            0,
+            0,
+            0,
+            false,
+            None,
+        )?;
+
+        let token_mint = a.vault_state.token_mint;
+        let signer_seeds: &[&[&[u8]]] = &[&[b"vault".as_ref(), token_mint.as_ref(), &[a.vault_state.bump]]];
+
+        let increase = cpi::accounts::IncreaseLiquidityV2 {
+            nft_owner: a.vault_state.to_account_info(),
+            nft_account: a.position_nft_account.to_account_info(),
+            pool_state: a.pool_state.to_account_info(),
+            protocol_position: a.protocol_position.to_account_info(),
+            personal_position: a.personal_position.to_account_info(),
+            tick_array_lower: a.tick_array_lower.to_account_info(),
+            tick_array_upper: a.tick_array_upper.to_account_info(),
+            token_account_0: a.token_account_0.to_account_info(),
+            token_account_1: a.token_account_1.to_account_info(),
+            token_vault_0: a.token_vault_0.to_account_info(),
+            token_vault_1: a.token_vault_1.to_account_info(),
+            token_program: a.token_program.to_account_info(),
+            token_program_2022: a.token_program_2022.to_account_info(),
+            vault_0_mint: a.vault_0_mint.to_account_info(),
+            vault_1_mint: a.vault_1_mint.to_account_info(),
+        };
+
+        cpi::increase_liquidity_v2(
+            CpiContext::new_with_signer(a.clmm_program.to_account_info(), increase, signer_seeds)
+                .with_remaining_accounts(ctx.remaining_accounts.to_vec()),
+            0,
+            amount_0_max,
+            amount_1_max,
+            Some(true),
+        )?;
+
+        msg!("Position opened: ticks {}..{}, nft={}", tick_lower, tick_upper, a.position_nft_mint.key());
+        Ok(())
+    }
+
+    /// Неделя 13: Сбор накопленных комиссий (harvest fees) в хранилища vault
+    pub fn collect_fees<'info>(ctx: Context<'_, '_, 'info, 'info, ManageVaultPosition<'info>>) -> Result<()> {
+        decrease_position(&ctx, 0, 0, 0)?;
+        msg!("Fees collected for nft {}", ctx.accounts.position_nft_mint.key());
+        Ok(())
+    }
+
+    /// Неделя 13: Закрытие позиции, полный вывод ликвидности и сжигание Position NFT
+    pub fn close_raydium_position<'info>(
+        ctx: Context<'_, '_, 'info, 'info, ManageVaultPosition<'info>>,
+        amount_0_min: u64,
+        amount_1_min: u64,
+    ) -> Result<()> {
+        let liquidity = ctx.accounts.personal_position.load()?.liquidity;
+        decrease_position(&ctx, liquidity, amount_0_min, amount_1_min)?;
+
+        let a = &ctx.accounts;
+        let token_mint = a.vault_state.token_mint;
+        let signer_seeds: &[&[&[u8]]] = &[&[b"vault".as_ref(), token_mint.as_ref(), &[a.vault_state.bump]]];
+
+        let close = cpi::accounts::ClosePosition {
+            nft_owner: a.vault_state.to_account_info(),
+            position_nft_mint: a.position_nft_mint.to_account_info(),
+            position_nft_account: a.position_nft_account.to_account_info(),
+            personal_position: a.personal_position.to_account_info(),
+            system_program: a.system_program.to_account_info(),
+            token_program: a.token_program_2022.to_account_info(),
+        };
+
+        cpi::close_position(CpiContext::new_with_signer(
+            a.clmm_program.to_account_info(),
+            close,
+            signer_seeds,
+        ))?;
+
+        msg!("Position closed: liquidity {} returned to vault", liquidity);
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn require_vault_storages(vault: &VaultState, strategy: &Strategy, account_0: Pubkey, account_1: Pubkey) -> Result<()> {
+    let storages = [vault.vault_token_account, strategy.second_token_account];
+    require!(
+        storages.contains(&account_0) && storages.contains(&account_1) && account_0 != account_1,
+        VaultError::NotVaultStorage
+    );
+    Ok(())
+}
+
+fn decrease_position<'info>(
+    ctx: &Context<'_, '_, 'info, 'info, ManageVaultPosition<'info>>,
+    liquidity: u128,
+    amount_0_min: u64,
+    amount_1_min: u64,
+) -> Result<()> {
+    let a = &ctx.accounts;
+    require_vault_storages(&a.vault_state, &a.strategy, a.token_account_0.key(), a.token_account_1.key())?;
+
+    let token_mint = a.vault_state.token_mint;
+    let signer_seeds: &[&[&[u8]]] = &[&[b"vault".as_ref(), token_mint.as_ref(), &[a.vault_state.bump]]];
+
+    let decrease = cpi::accounts::DecreaseLiquidityV2 {
+        nft_owner: a.vault_state.to_account_info(),
+        nft_account: a.position_nft_account.to_account_info(),
+        personal_position: a.personal_position.to_account_info(),
+        pool_state: a.pool_state.to_account_info(),
+        protocol_position: a.protocol_position.to_account_info(),
+        token_vault_0: a.token_vault_0.to_account_info(),
+        token_vault_1: a.token_vault_1.to_account_info(),
+        tick_array_lower: a.tick_array_lower.to_account_info(),
+        tick_array_upper: a.tick_array_upper.to_account_info(),
+        recipient_token_account_0: a.token_account_0.to_account_info(),
+        recipient_token_account_1: a.token_account_1.to_account_info(),
+        token_program: a.token_program.to_account_info(),
+        token_program_2022: a.token_program_2022.to_account_info(),
+        memo_program: a.memo_program.to_account_info(),
+        vault_0_mint: a.vault_0_mint.to_account_info(),
+        vault_1_mint: a.vault_1_mint.to_account_info(),
+    };
+
+    cpi::decrease_liquidity_v2(
+        CpiContext::new_with_signer(a.clmm_program.to_account_info(), decrease, signer_seeds)
+            .with_remaining_accounts(ctx.remaining_accounts.to_vec()),
+        liquidity,
+        amount_0_min,
+        amount_1_min,
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -519,13 +676,158 @@ pub struct SwapRaydium<'info> {
     pub input_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
     pub output_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
 
-    /// CHECK: Raydium CLMM program address
+    /// CHECK: Raydium CLMM program
     #[account(address = raydium_clmm_cpi::id())]
     pub clmm_program: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
     pub token_program_2022: Program<'info, Token2022>,
     pub memo_program: Program<'info, Memo>,
+}
+
+#[derive(Accounts)]
+pub struct OpenRaydiumPosition<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"vault", vault_state.token_mint.as_ref()],
+        bump = vault_state.bump,
+        constraint = vault_state.admin == admin.key() @ VaultError::Unauthorized,
+    )]
+    pub vault_state: Account<'info, VaultState>,
+
+    #[account(
+        seeds = [b"strategy", vault_state.key().as_ref()],
+        bump = strategy.bump,
+        constraint = strategy.pool == pool_state.key() @ VaultError::WrongPool,
+    )]
+    pub strategy: Account<'info, Strategy>,
+
+    #[account(mut)]
+    pub pool_state: AccountLoader<'info, PoolState>,
+
+    #[account(mut)]
+    pub protocol_position: Box<Account<'info, ProtocolPositionState>>,
+
+    /// Position NFT Mint
+    #[account(mut)]
+    pub position_nft_mint: Signer<'info>,
+
+    /// Position NFT ATA — принадлежит vault PDA
+    #[account(
+        init,
+        payer = admin,
+        associated_token::mint = position_nft_mint,
+        associated_token::authority = vault_state,
+    )]
+    pub position_nft_account: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut)]
+    pub personal_position: Box<Account<'info, PersonalPositionState>>,
+
+    #[account(mut)]
+    pub tick_array_lower: AccountLoader<'info, TickArrayState>,
+
+    #[account(mut)]
+    pub tick_array_upper: AccountLoader<'info, TickArrayState>,
+
+    #[account(mut)]
+    pub token_account_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+
+    #[account(mut)]
+    pub token_account_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+
+    #[account(mut)]
+    pub token_vault_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+
+    #[account(mut)]
+    pub token_vault_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+
+    pub rent: Sysvar<'info, Rent>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub token_program_2022: Program<'info, Token2022>,
+
+    pub vault_0_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
+    pub vault_1_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
+
+    /// CHECK: Raydium CLMM program
+    #[account(address = raydium_clmm_cpi::id())]
+    pub clmm_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ManageVaultPosition<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"vault", vault_state.token_mint.as_ref()],
+        bump = vault_state.bump,
+        constraint = vault_state.admin == admin.key() @ VaultError::Unauthorized,
+    )]
+    pub vault_state: Account<'info, VaultState>,
+
+    #[account(
+        seeds = [b"strategy", vault_state.key().as_ref()],
+        bump = strategy.bump,
+        constraint = strategy.pool == pool_state.key() @ VaultError::WrongPool,
+    )]
+    pub strategy: Account<'info, Strategy>,
+
+    #[account(mut)]
+    pub pool_state: AccountLoader<'info, PoolState>,
+
+    #[account(mut)]
+    pub protocol_position: Box<Account<'info, ProtocolPositionState>>,
+
+    #[account(mut)]
+    pub position_nft_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
+
+    #[account(
+        mut,
+        token::mint = position_nft_mint,
+        token::authority = vault_state,
+    )]
+    pub position_nft_account: Box<Account<'info, TokenAccount>>,
+
+    #[account(mut)]
+    pub personal_position: AccountLoader<'info, PersonalPositionState>,
+
+    #[account(mut)]
+    pub tick_array_lower: AccountLoader<'info, TickArrayState>,
+
+    #[account(mut)]
+    pub tick_array_upper: AccountLoader<'info, TickArrayState>,
+
+    #[account(mut)]
+    pub token_account_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+
+    #[account(mut)]
+    pub token_account_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+
+    #[account(mut)]
+    pub token_vault_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+
+    #[account(mut)]
+    pub token_vault_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+    pub token_program_2022: Program<'info, Token2022>,
+    pub memo_program: Program<'info, Memo>,
+
+    pub vault_0_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
+    pub vault_1_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
+
+    pub system_program: Program<'info, System>,
+
+    /// CHECK: Raydium CLMM program
+    #[account(address = raydium_clmm_cpi::id())]
+    pub clmm_program: UncheckedAccount<'info>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
