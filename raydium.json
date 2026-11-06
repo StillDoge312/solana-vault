@@ -1,0 +1,16 @@
+{
+  "vaultToken": "Fmke9hR8YLR127as4pPpPx4DLQgt1Pjh5rAqTWHzgUBx",
+  "tusd": "4NqnPuNnGra15G4RfjoahuTuTcNzN2C33wLobSjRubZ4",
+  "clmmProgram": "devi51mZmdwUJGU9hjN27vEz64Gps7uUefqxg27EAtH",
+  "ammConfig": "CD4aJtX11cqTCAc83nxSPkkh5JW2yjD6uwHeovjqQ1qu",
+  "poolId": "7pSVsGQ3wvc6rLFgraye6Y6LqrFcr43f5wD3gCHiAj8p",
+  "pool_mintAVault": "FJtsy5XaXe3ymq1dGMLxDGSNnMBiceAWFsY7HM1PuAjn",
+  "pool_mintBVault": "4Yrov3k9wnB8XJ1NosHd2an9Tbdwdi5DZqC8GgzP4Xcg",
+  "pool_observationId": "5t7pCp4KnMvpX8TdjBToH46ac3YthyqctVztsmMgZkAt",
+  "pool_exBitmapAccount": "DKb27XLaRFT47WcnoBiBgn5xhYcawsJ9FRhKF8d1SD7T",
+  "positionNft": "GAiadcKH2kUTvkvpL8iWWUYCiYQHw4ifDUr2GgfEvMh9",
+  "positionTickLower": -8040,
+  "positionTickUpper": -6000,
+  "initialPrice": 2.0,
+  "sqrtPriceX64": "26087635650863001600"
+}
